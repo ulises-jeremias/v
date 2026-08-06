@@ -148,24 +148,74 @@ fn (mut t Transformer) return_values_from_ids(ids []flat.NodeId) []flat.NodeId {
 	return vals
 }
 
-// return_expr_is_err supports return expr is err handling for Transformer.
-fn (t &Transformer) return_expr_is_err(id flat.NodeId) bool {
-	if int(id) < 0 {
+fn (mut t Transformer) return_expr_is_propagated_err(id flat.NodeId, payload_type string) bool {
+	if int(id) < 0 || int(id) >= t.a.nodes.len {
 		return false
 	}
 	node := t.a.nodes[int(id)]
-	if node.kind != .ident || node.value != 'err' {
+	actual_type := t.return_ierror_expr_type(id)
+	if actual_type.len == 0 {
 		return false
 	}
-	typ := node.typ
-	if typ == 'IError' || typ.ends_with('.IError') {
+	// Explicit error construction and the active implicit `err` binding denote
+	// failure. Other IError-compatible values can instead be successful payloads
+	// when the surrounding result expects their type (for example `!IError`).
+	if t.is_error_call(node)
+		|| (node.kind == .ident && node.value == 'err' && t.implicit_err_binding_active()) {
 		return true
 	}
-	var_type := t.var_type('err')
-	if var_type.len > 0 {
-		return var_type == 'IError' || var_type.ends_with('.IError')
+	if payload_type.len == 0 || payload_type == 'unknown' || payload_type.contains('unknown') {
+		return true
 	}
-	return false
+	return !t.resolved_receiver_arg_compatible(id, actual_type, payload_type)
+}
+
+fn (t &Transformer) return_ierror_expr_type(id flat.NodeId) string {
+	if int(id) < 0 || int(id) >= t.a.nodes.len {
+		return ''
+	}
+	node := t.a.nodes[int(id)]
+	primary_type := match node.kind {
+		.struct_init, .cast_expr, .as_expr {
+			node.value
+		}
+		.ident {
+			t.var_type(node.value)
+		}
+		.call {
+			t.get_call_return_type(id, node)
+		}
+		else {
+			''
+		}
+	}
+	if typ := t.return_ierror_type_candidate(primary_type) {
+		return typ
+	}
+	for typ in [node.typ, t.raw_checker_node_type(id), t.original_expr_type(id),
+		t.node_type(id)] {
+		if candidate := t.return_ierror_type_candidate(typ) {
+			return candidate
+		}
+	}
+	return ''
+}
+
+fn (t &Transformer) return_ierror_type_candidate(typ string) ?string {
+	if typ.len == 0 || typ == 'unknown' || typ.contains('unknown') {
+		return none
+	}
+	if t.is_ierror_type(typ) {
+		return typ
+	}
+	if !t.is_type_alias_name(t.trim_pointer_type(typ)) {
+		return none
+	}
+	resolved := t.alias_str_resolved_base_type(typ)
+	if resolved != typ && t.is_ierror_type(resolved) {
+		return resolved
+	}
+	return none
 }
 
 fn (mut t Transformer) try_return_direct_optional_expr(node flat.Node) ?[]flat.NodeId {
@@ -256,7 +306,8 @@ fn (mut t Transformer) try_convert_forwarded_wrapped_multi_return(value_id flat.
 	}
 	mut needs_conversion := false
 	for i, actual_type in actual_types {
-		if actual_type.name() != expected_types[i].name() {
+		if actual_type.name() != expected_types[i].name()
+			&& t.forwarded_slot_conversion_supported(actual_type, expected_types[i]) {
 			needs_conversion = true
 			break
 		}
@@ -288,7 +339,13 @@ fn (t &Transformer) return_expr_is_optional_result(id flat.NodeId) bool {
 				return t.is_optional_type_name(ret.name())
 			}
 		}
-		return t.is_optional_type_name(t.get_call_return_type(id, node))
+		call_type := t.get_call_return_type(id, node)
+		if t.is_optional_type_name(call_type) {
+			return true
+		}
+		// Interface selector calls can have no canonical call name while their
+		// checker annotation still carries the exact Option/Result return type.
+		return t.is_optional_type_name(t.node_type(id))
 	}
 	if node.kind == .ident {
 		typ := t.var_type(node.value)
@@ -311,7 +368,8 @@ fn (mut t Transformer) try_expand_forwarded_multi_return(source_return_id flat.N
 	actual_types := t.multi_return_types_for_expr(value_id, expected_types.len) or { return none }
 	mut needs_conversion := false
 	for i, actual_type in actual_types {
-		if actual_type.name() != expected_types[i].name() {
+		if actual_type.name() != expected_types[i].name()
+			&& t.forwarded_slot_conversion_supported(actual_type, expected_types[i]) {
 			needs_conversion = true
 			break
 		}
@@ -335,6 +393,9 @@ fn (mut t Transformer) try_expand_forwarded_multi_return(source_return_id flat.N
 }
 
 fn (mut t Transformer) transform_forwarded_return_slot(value_id flat.NodeId, actual types.Type, expected types.Type) flat.NodeId {
+	if !t.forwarded_slot_conversion_supported(actual, expected) {
+		return t.transform_expr(value_id)
+	}
 	actual_base := forwarded_return_unalias_type(actual)
 	expected_base := forwarded_return_unalias_type(expected)
 	if actual_base is types.OptionType && expected_base is types.OptionType
@@ -376,10 +437,16 @@ fn (mut t Transformer) transform_forwarded_return_slot(value_id flat.NodeId, act
 }
 
 fn (t &Transformer) forwarded_slot_conversion_supported(actual types.Type, expected types.Type) bool {
+	if forwarded_return_type_is_unresolved(actual) || forwarded_return_type_is_unresolved(expected) {
+		return false
+	}
 	actual_base := forwarded_return_unalias_type(actual)
 	expected_base := forwarded_return_unalias_type(expected)
 	if actual_base.name() == expected_base.name() {
 		return false
+	}
+	if actual_base.is_integer() && expected_base.is_integer() {
+		return true
 	}
 	if expected_base is types.Interface {
 		return true
@@ -410,6 +477,31 @@ fn (t &Transformer) forwarded_slot_conversion_supported(actual types.Type, expec
 	if actual_base is types.Map && expected_base is types.Map {
 		return t.forwarded_slot_conversion_supported(actual_base.key_type, expected_base.key_type)
 			|| t.forwarded_slot_conversion_supported(actual_base.value_type, expected_base.value_type)
+	}
+	return false
+}
+
+fn forwarded_return_type_is_unresolved(typ types.Type) bool {
+	base := forwarded_return_unalias_type(typ)
+	name := base.name().trim_space()
+	if name == 'unknown' || name.ends_with('.unknown') || is_generic_placeholder_type_name(name) {
+		return true
+	}
+	if base is types.OptionType {
+		return forwarded_return_type_is_unresolved(base.base_type)
+	}
+	if base is types.ResultType {
+		return forwarded_return_type_is_unresolved(base.base_type)
+	}
+	if base is types.Array {
+		return forwarded_return_type_is_unresolved(base.elem_type)
+	}
+	if base is types.ArrayFixed {
+		return forwarded_return_type_is_unresolved(base.elem_type)
+	}
+	if base is types.Map {
+		return forwarded_return_type_is_unresolved(base.key_type)
+			|| forwarded_return_type_is_unresolved(base.value_type)
 	}
 	return false
 }
@@ -799,7 +891,17 @@ fn (mut t Transformer) match_branch_return_block(branch flat.Node, body_start_id
 	} else {
 		tail_expr
 	}
-	ret_val := t.transform_return_child(actual_tail, 0, 1)
+	mut ret_val := t.transform_return_child(actual_tail, 0, 1)
+	direct_fn_value := tail_expr_node.kind == .ident && t.is_optional_type_name(ret_typ)
+		&& t.is_fn_pointer_type_name(t.normalize_type_alias(t.optional_base_type(ret_typ)))
+		&& t.resolved_ident_fn_value(tail_expr, tail_expr_node.value) != none
+	if t.is_optional_type_name(ret_typ) && tail_expr_node.kind != .none_expr
+		&& !t.is_error_call(tail_expr_node) && direct_fn_value {
+		// Match branch tails have already been transformed to the payload type.
+		// Preserve that fact explicitly so C generation does not have to recover
+		// a contextual Option/Result from the original function-value expression.
+		ret_val = t.make_optional_some(ret_val, t.qualify_optional_type(ret_typ))
+	}
 	t.drain_pending(mut all)
 	all << t.make_transformed_return(ret_val, ret_typ, source_return_id)
 	return t.make_block(all)
@@ -847,7 +949,12 @@ fn (mut t Transformer) build_return_match_chain(match_expr_id flat.NodeId, orig_
 		return body_block
 	}
 
+	outer_pending := t.pending_stmts.clone()
+	t.pending_stmts.clear()
 	cond_id := t.build_match_cond(match_expr_id, branch)
+	mut cond_prelude := []flat.NodeId{}
+	t.drain_pending(mut cond_prelude)
+	t.pending_stmts = outer_pending
 	mut if_ids := []flat.NodeId{}
 	if_ids << cond_id
 	if_ids << body_block
@@ -859,11 +966,16 @@ fn (mut t Transformer) build_return_match_chain(match_expr_id flat.NodeId, orig_
 	for id in if_ids {
 		t.a.children << id
 	}
-	return t.a.add_node(flat.Node{
+	if_id := t.a.add_node(flat.Node{
 		kind:           .if_expr
 		children_start: if_start
 		children_count: flat.child_count(if_ids.len)
 	})
+	if cond_prelude.len > 0 {
+		cond_prelude << if_id
+		return t.make_block(cond_prelude)
+	}
+	return if_id
 }
 
 // build_return_match_type_branch_chain supports build_return_match_type_branch_chain handling.
@@ -970,7 +1082,8 @@ fn (mut t Transformer) try_expand_return_match(source_return_id flat.NodeId, nod
 	for i in 1 .. val.children_count {
 		branches << t.a.child(&val, i)
 	}
-	result << t.build_return_match_chain(actual_expr_id, match_expr_id, branches, 0, node.typ,
+	ret_typ := if t.cur_fn_ret_type.len > 0 { t.cur_fn_ret_type } else { node.typ }
+	result << t.build_return_match_chain(actual_expr_id, match_expr_id, branches, 0, ret_typ,
 		source_return_id)
 	return result
 }

@@ -1251,14 +1251,14 @@ fn main() {
 	assert fail_returned_borrow.output.contains('cannot move `s` because it is borrowed by `r`'), fail_returned_borrow.output
 
 	fail_mut_borrow := run_ownership_check(v3_bin, 'mut_param_borrow_twice', "
-fn both(mut a string, mut b string) {
+fn both[T](mut a T, mut b T) {
 	_ = a
 	_ = b
 }
 
 fn main() {
 	mut s := 'hello'.to_owned()
-	both(mut s, mut s)
+	both[string](mut s, mut s)
 }
 ")
 	assert fail_mut_borrow.exit_code != 0
@@ -2981,10 +2981,10 @@ fn main() {
 		cond = false
 		_ = j
 	}
-}
+	}
 ')
 	assert fail_loop_post_body_local.exit_code != 0
-	assert fail_loop_post_body_local.output.contains('unknown identifier `j`'), fail_loop_post_body_local.output
+	assert fail_loop_post_body_local.output.contains('undefined variable `j`'), fail_loop_post_body_local.output
 
 	ok_labeled_break := run_ownership_check(v3_bin, 'labeled_break_targets_outer_loop', "
 fn main() {
@@ -3140,7 +3140,7 @@ fn main() {
 
 fn test_ownership_veb_implicit_context_arg_moves() {
 	v3_bin := ownership_build_v3()
-	fail := run_ownership_check(v3_bin, 'veb_implicit_ctx_arg_move', '
+	fail := run_ownership_check_with_module(v3_bin, 'veb_implicit_ctx_arg_move', '
 import veb
 
 pub struct Context {
@@ -3165,6 +3165,13 @@ fn main() {
 	app := &App{}
 	_ = app
 }
+',
+		'veb', '
+module veb
+
+pub struct Context {}
+
+pub struct Result {}
 ')
 	assert fail.exit_code != 0
 	assert fail.output.contains('use of moved value: `s`'), fail.output

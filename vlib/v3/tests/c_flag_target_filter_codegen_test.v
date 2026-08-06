@@ -82,7 +82,7 @@ fn test_c_flag_target_filter_drops_termux_off_termux() {
 	assert run.output.trim_space() == 'termux-filter-ok'
 }
 
-fn test_objective_c_flags_skip_tcc_and_select_objective_c_language() {
+fn test_objective_c_flags_are_applied_to_standalone_build() {
 	$if !macos {
 		return
 	}
@@ -90,21 +90,25 @@ fn test_objective_c_flags_skip_tcc_and_select_objective_c_language() {
 	v3_bin := os.join_path(os.temp_dir(), 'v3_objective_c_flag_test_${pid}')
 	os.rm(v3_bin) or {}
 	build :=
-		os.execute('${vexe} -gc none -path "${vlib_dir}|@vlib|@vmodules" -o ${v3_bin} ${v3_src}')
+		os.execute('${vexe} -gc none -prealloc -path "${vlib_dir}|@vlib|@vmodules" -o ${v3_bin} ${v3_src}')
 	assert build.exit_code == 0, build.output
 
 	src := os.join_path(os.temp_dir(), 'v3_objective_c_flag_input_${pid}.v')
-	os.write_file(src, "#flag darwin -fobjc-arc\nfn main() {\n\tprintln('objc-flag-ok')\n}\n") or {
+	os.write_file(src,
+		"#flag darwin -fobjc-arc\n#flag darwin -lobjc\n#include <objc/message.h>\ntype Msg = fn (voidptr, voidptr) voidptr\nfn C.objc_msgSend(obj voidptr, sel voidptr) voidptr\nfn main() {\n\t_ := unsafe { Msg(C.objc_msgSend) }\n\tprintln('objc-flag-ok')\n}\n") or {
 		panic(err)
 	}
 	bin := os.join_path(os.temp_dir(), 'v3_objective_c_flag_input_${pid}')
 	os.rm(bin) or {}
 	os.rmdir_all(bin) or {}
-	compile := os.execute('${v3_bin} ${src} -b c -o ${bin}')
+	compile := os.execute('${v3_bin} -no-memory-limit -b c -o ${bin} ${src}')
 	assert compile.exit_code == 0, compile.output
-	assert !compile.output.contains('tcc.exe'), compile.output
-	assert compile.output.contains('-x objective-c'), compile.output
-	assert compile.output.contains('-x none'), compile.output
+	cc_lines := compile.output.split_into_lines().filter(it.contains('> cc '))
+	assert cc_lines.len == 1, compile.output
+	cc_line := cc_lines[0]
+	assert cc_line.contains('-fobjc-arc'), cc_line
+	assert cc_line.contains('-x objective-c'), cc_line
+	assert !compile.output.contains('C dylib cache'), compile.output
 
 	run := os.execute(bin)
 	assert run.exit_code == 0, run.output
